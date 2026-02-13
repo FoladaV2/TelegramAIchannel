@@ -10,7 +10,7 @@ import socket
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from telegram import Bot
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Load environment variables
 load_dotenv()
@@ -21,6 +21,26 @@ bot = Bot(token=TOKEN)
 # Fix SSL certificate issues
 if hasattr(ssl, '_create_unverified_context'):
     ssl._create_default_https_context = ssl._create_unverified_context
+
+# Add Flask for health check (to prevent Render from sleeping)
+try:
+    from flask import Flask
+    app = Flask(__name__)
+    
+    @app.route('/')
+    def home():
+        return "Bot is running!", 200
+    
+    # Run Flask in a separate thread
+    import threading
+    def run_flask():
+        app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+except ImportError:
+    # If Flask is not available, continue without it
+    pass
 
 # Persistent post memory
 POST_LOG_FILE = "sent_posts.txt"
@@ -246,7 +266,7 @@ def fetch_all(sources):
     return all_entries
 
 
-async def post_scheduled(posts, interval_minutes=5):
+async def post_scheduled(posts, interval_minutes=10):
     """Post messages to Telegram with scheduling"""
     if not posts:
         print("No posts to send.")
@@ -295,10 +315,90 @@ def cleanup_old_posts():
             print(f"Error cleaning up post log: {e}")
 
 
+# Global variable to store posts for the day
+daily_posts = []
+
+
+
+
+
+async def post_at_specific_times(posts_for_day):
+    """Post messages at specific times of the day (morning, afternoon, evening)"""
+    if not posts_for_day:
+        print("No posts to send today.")
+        return
+    
+    # Divide posts into 3 batches for morning, afternoon, and evening
+    posts_per_batch = max(1, len(posts_for_day) // 3)
+    remainder = len(posts_for_day) % 3
+    
+    morning_posts = posts_for_day[:posts_per_batch + (1 if remainder > 0 else 0)]
+    afternoon_posts = posts_for_day[posts_per_batch + (1 if remainder > 0 else 0):posts_per_batch * 2 + (1 if remainder > 0 else 0) + (1 if remainder > 1 else 0)]
+    evening_posts = posts_for_day[posts_per_batch * 2 + (1 if remainder > 0 else 0) + (1 if remainder > 1 else 0):]
+
+    print(f"Scheduled {len(morning_posts)} posts for morning, {len(afternoon_posts)} for afternoon, {len(evening_posts)} for evening")
+
+    # Post at scheduled times
+    for batch, batch_name in [(morning_posts, "morning"), (afternoon_posts, "afternoon"), (evening_posts, "evening")]:
+        if batch:
+            # Wait until the appropriate time slot
+            now = datetime.now()
+            target_time = None
+            
+            if batch_name == "morning":
+                target_time = now.replace(hour=8, minute=0, second=0, microsecond=0)
+                if now.time() >= target_time.time() and now.time() <= datetime.combine(now.date(), datetime.min.time()).replace(hour=10, minute=0).time():
+                    # We're already in morning window, post now
+                    target_time = now
+                elif now.time() > datetime.combine(now.date(), datetime.min.time()).replace(hour=10, minute=0).time():
+                    # It's after morning window, wait until tomorrow morning
+                    target_time = target_time + timedelta(days=1)
+            elif batch_name == "afternoon":
+                target_time = now.replace(hour=13, minute=0, second=0, microsecond=0)
+                if now.time() >= target_time.time() and now.time() <= datetime.combine(now.date(), datetime.min.time()).replace(hour=15, minute=0).time():
+                    # We're already in afternoon window, post now
+                    target_time = now
+                elif now.time() > datetime.combine(now.date(), datetime.min.time()).replace(hour=15, minute=0).time():
+                    # It's after afternoon window, wait until tomorrow afternoon
+                    target_time = target_time + timedelta(days=1)
+                elif now.time() < datetime.combine(now.date(), datetime.min.time()).replace(hour=8, minute=0).time():
+                    # It's before morning window, wait until afternoon today
+                    pass
+                elif now.time() <= datetime.combine(now.date(), datetime.min.time()).replace(hour=10, minute=0).time():
+                    # It's in morning window, wait until afternoon today
+                    pass
+            else:  # evening
+                target_time = now.replace(hour=18, minute=0, second=0, microsecond=0)
+                if now.time() >= target_time.time() and now.time() <= datetime.combine(now.date(), datetime.min.time()).replace(hour=20, minute=0).time():
+                    # We're already in evening window, post now
+                    target_time = now
+                elif now.time() > datetime.combine(now.date(), datetime.min.time()).replace(hour=20, minute=0).time():
+                    # It's after evening window, wait until tomorrow evening
+                    target_time = target_time + timedelta(days=1)
+                elif now.time() < datetime.combine(now.date(), datetime.min.time()).replace(hour=8, minute=0).time():
+                    # It's before morning window, wait until evening today
+                    pass
+                elif now.time() >= datetime.combine(now.date(), datetime.min.time()).replace(hour=13, minute=0).time() and now.time() <= datetime.combine(now.date(), datetime.min.time()).replace(hour=15, minute=0).time():
+                    # It's in afternoon window, wait until evening today
+                    pass
+            
+            # Calculate sleep time if needed
+            if target_time and target_time > now:
+                sleep_time = (target_time - now).total_seconds()
+                print(f"Waiting {sleep_time/60:.1f} minutes until {batch_name} posting time...")
+                await asyncio.sleep(sleep_time)
+            
+            print(f"Starting {batch_name} posting session at {datetime.now().strftime('%H:%M:%S')}")
+            
+            # Post all posts in this batch with intervals between each post
+            await post_scheduled(batch, interval_minutes=10)
+
+
 if __name__ == "__main__":
     async def main():
-        print(f"Starting AI RSS Bot at {datetime.now()}")
-
+        print(f"Starting AI RSS Bot with scheduled posting at {datetime.now()}")
+        global daily_posts
+        
         while True:
             try:
                 print(f"\n--- New fetch cycle started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
@@ -310,15 +410,31 @@ if __name__ == "__main__":
                 posts = fetch_all(SOURCES)
 
                 if posts:
-                    print(f"Found {len(posts)} new posts to send")
-                    await post_scheduled(posts, interval_minutes=0)
-                    print("Finished posting batch")
+                    print(f"Found {len(posts)} new posts to add to daily queue")
+                    # Add new posts to the daily queue
+                    daily_posts.extend(posts)
                 else:
                     print("No new posts found in this cycle")
+                
+                # Check if we have accumulated posts and if it's an appropriate time to post
+                now = datetime.now()
+                current_hour = now.hour
+                
+                # Check if we're in any of the posting windows (morning: 8-10, afternoon: 13-15, evening: 18-20)
+                if (8 <= current_hour <= 10) or (13 <= current_hour <= 15) or (18 <= current_hour <= 20):
+                    if daily_posts:
+                        print(f"Currently in posting window. Preparing to post {len(daily_posts)} accumulated posts")
+                        await post_at_specific_times(daily_posts.copy())
+                        daily_posts.clear()
+                        print("Finished scheduled posting session")
+                    else:
+                        print("Currently in posting window but no posts to send")
+                else:
+                    print(f"Currently outside posting windows, saving {len(daily_posts)} posts for scheduled times")
 
-                # Wait 3 hours before next cycle
-                print(f"Waiting 3 hours until next fetch cycle...")
-                await asyncio.sleep(3 * 60 * 60)
+                # Wait 1 hour before checking for new posts again
+                print(f"Waiting 1 hour until next fetch cycle...")
+                await asyncio.sleep(1 * 60 * 60)
 
             except KeyboardInterrupt:
                 print("Bot stopped by user")
